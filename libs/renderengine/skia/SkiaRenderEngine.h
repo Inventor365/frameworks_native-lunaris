@@ -160,6 +160,12 @@ private:
 
     std::shared_ptr<AutoBackendTexture::LocalRef> getOrCreateBackendTexture(
             const sp<GraphicBuffer>& buffer, bool isOutputBuffer) REQUIRES(mRenderingMutex);
+    std::shared_ptr<AutoBackendTexture::LocalRef> takeTransientBackendTexture(
+            const sp<GraphicBuffer>& buffer, bool isOutputBuffer) REQUIRES(mRenderingMutex);
+    void storeTransientBackendTexture(
+            const sp<GraphicBuffer>& buffer, bool isOutputBuffer,
+            const std::shared_ptr<AutoBackendTexture::LocalRef>& texture)
+            REQUIRES(mRenderingMutex);
     void initCanvas(SkCanvas* canvas, const DisplaySettings& display);
     void drawShadow(SkCanvas* canvas, const SkRRect& casterRRect,
                     const ShadowSettings& shadowSettings);
@@ -205,7 +211,18 @@ private:
             GUARDED_BY(mRenderingMutex);
     std::unordered_map<GraphicBufferId, std::shared_ptr<AutoBackendTexture::LocalRef>> mTextureCache
             GUARDED_BY(mRenderingMutex);
+    std::unordered_map<GraphicBufferId, bool> mTextureCacheOutputBuffers
+            GUARDED_BY(mRenderingMutex);
     AutoBackendTexture::CleanupManager mTextureCleanupMgr GUARDED_BY(mRenderingMutex);
+
+    struct TransientBackendTextureEntry {
+        GraphicBufferId id;
+        sp<GraphicBuffer> buffer;
+        bool isOutputBuffer;
+        std::shared_ptr<AutoBackendTexture::LocalRef> texture;
+    };
+    static constexpr size_t kTransientBackendTextureCacheMaxEntries = 32;
+    std::deque<TransientBackendTextureEntry> mTransientTextureCache GUARDED_BY(mRenderingMutex);
 
     // Alphabetical by type name
     // TODO(b/380159947): move these into RuntimeEffectManager
@@ -218,6 +235,15 @@ private:
 
     sp<Fence> mLastDrawFence;
     BlurFilter* mBlurFilter = nullptr;
+
+    struct BlurCacheEntry {
+        sk_sp<SkImage> image;
+        uint64_t inputHash;
+        uint32_t blurRadius;
+        SkIRect blurRect;
+    };
+    static constexpr size_t kBlurCacheMaxEntries = 4;
+    std::deque<BlurCacheEntry> mBlurCache;
 
     // Object to capture commands send to Skia.
     std::unique_ptr<SkiaCapture> mCapture;

@@ -18,6 +18,7 @@
 
 #include "SkiaRenderEngine.h"
 
+#include <ax_graphics/MediaBufferConverter.h>
 #include <SkBlendMode.h>
 #include <SkBlurTypes.h>
 #include <SkCanvas.h>
@@ -70,6 +71,7 @@
 #include <deque>
 #include <memory>
 #include <numeric>
+#include <utility>
 
 #include "Cache.h"
 #include "ColorSpaces.h"
@@ -401,6 +403,10 @@ SkiaRenderEngine::~SkiaRenderEngine() { }
 void SkiaRenderEngine::finishRenderingAndAbandonContexts() {
     std::lock_guard<std::mutex> lock(mRenderingMutex);
 
+    mBlurCache.clear();
+    mTransientTextureCache.clear();
+    mTextureCacheOutputBuffers.clear();
+
     if (mBlurFilter) {
         delete mBlurFilter;
     }
@@ -530,6 +536,15 @@ void SkiaRenderEngine::mapExternalTextureBuffer(const sp<GraphicBuffer>& buffer,
     if (isProtectedBuffer || isProtected() || !isGpuSampleable) {
         return;
     }
+    if (axion::graphics::MediaBufferConverter::isConversionEnabled()) {
+        AHardwareBuffer_Desc desc;
+        AHardwareBuffer_describe(buffer->toAHardwareBuffer(), &desc);
+        ui::Dataspace dataspace = ui::Dataspace::UNKNOWN;
+        buffer->getDataspace(&dataspace);
+        if (axion::graphics::MediaBufferConverter::isMediaOrHdrBuffer(desc, static_cast<int32_t>(dataspace))) {
+            return;
+        }
+    }
     SFTRACE_CALL();
 
     // If we were to support caching protected buffers then we will need to switch the
@@ -539,18 +554,25 @@ void SkiaRenderEngine::mapExternalTextureBuffer(const sp<GraphicBuffer>& buffer,
     auto& cache = mTextureCache;
 
     std::lock_guard<std::mutex> lock(mRenderingMutex);
-    mGraphicBufferExternalRefs[buffer->getId()]++;
+    const auto id = buffer->getId();
+    mGraphicBufferExternalRefs[id]++;
 
-    if (const auto& iter = cache.find(buffer->getId()); iter == cache.end()) {
+    if (const auto& iter = cache.find(id); iter == cache.end()) {
+        bool outputBuffer = isRenderable;
         if (FlagManager::getInstance().renderable_buffer_usage()) {
             isRenderable = buffer->getUsage() & GRALLOC_USAGE_HW_RENDER;
+            outputBuffer = isRenderable;
         }
-        std::unique_ptr<SkiaBackendTexture> backendTexture =
-                context->makeBackendTexture(buffer->toAHardwareBuffer(), isRenderable);
-        auto imageTextureRef =
-                std::make_shared<AutoBackendTexture::LocalRef>(std::move(backendTexture),
-                                                               mTextureCleanupMgr);
-        cache.insert({buffer->getId(), imageTextureRef});
+        auto imageTextureRef = takeTransientBackendTexture(buffer, outputBuffer);
+        if (!imageTextureRef) {
+            std::unique_ptr<SkiaBackendTexture> backendTexture =
+                    context->makeBackendTexture(buffer->toAHardwareBuffer(), isRenderable);
+            imageTextureRef =
+                    std::make_shared<AutoBackendTexture::LocalRef>(std::move(backendTexture),
+                                                                   mTextureCleanupMgr);
+        }
+        cache.insert({id, imageTextureRef});
+        mTextureCacheOutputBuffers[id] = outputBuffer;
     }
 }
 
@@ -580,7 +602,13 @@ void SkiaRenderEngine::unmapExternalTextureBuffer(sp<GraphicBuffer>&& buffer) {
         useProtectedContext(buffer->getUsage() & GRALLOC_USAGE_PROTECTED);
 
         if (iter->second == 0) {
+            const auto cacheIter = mTextureCache.find(buffer->getId());
+            const auto outputIter = mTextureCacheOutputBuffers.find(buffer->getId());
+            if (cacheIter != mTextureCache.end() && outputIter != mTextureCacheOutputBuffers.end()) {
+                storeTransientBackendTexture(buffer, outputIter->second, cacheIter->second);
+            }
             mTextureCache.erase(buffer->getId());
+            mTextureCacheOutputBuffers.erase(buffer->getId());
             mGraphicBufferExternalRefs.erase(buffer->getId());
         }
 
@@ -592,18 +620,88 @@ void SkiaRenderEngine::unmapExternalTextureBuffer(sp<GraphicBuffer>&& buffer) {
     }
 }
 
+std::shared_ptr<AutoBackendTexture::LocalRef> SkiaRenderEngine::takeTransientBackendTexture(
+        const sp<GraphicBuffer>& buffer, bool isOutputBuffer) {
+    if (isProtected()) {
+        return nullptr;
+    }
+
+    const auto id = buffer->getId();
+    for (auto it = mTransientTextureCache.begin(); it != mTransientTextureCache.end(); ++it) {
+        if (it->id != id || it->isOutputBuffer != isOutputBuffer) {
+            continue;
+        }
+
+        auto texture = it->texture;
+        mTransientTextureCache.erase(it);
+        return texture;
+    }
+    return nullptr;
+}
+
+void SkiaRenderEngine::storeTransientBackendTexture(
+        const sp<GraphicBuffer>& buffer, bool isOutputBuffer,
+        const std::shared_ptr<AutoBackendTexture::LocalRef>& texture) {
+    if (isProtected() || (buffer->getUsage() & GRALLOC_USAGE_PROTECTED)) {
+        return;
+    }
+
+    const auto id = buffer->getId();
+    for (auto it = mTransientTextureCache.begin(); it != mTransientTextureCache.end();) {
+        if (it->id == id && it->isOutputBuffer == isOutputBuffer) {
+            it = mTransientTextureCache.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
+    mTransientTextureCache.push_front({id, buffer, isOutputBuffer, texture});
+    while (mTransientTextureCache.size() > kTransientBackendTextureCacheMaxEntries) {
+        mTransientTextureCache.pop_back();
+    }
+}
+
 std::shared_ptr<AutoBackendTexture::LocalRef> SkiaRenderEngine::getOrCreateBackendTexture(
         const sp<GraphicBuffer>& buffer, bool isOutputBuffer) {
+    AHardwareBuffer* bufferToUse = buffer->toAHardwareBuffer();
+    AHardwareBuffer* convertedBuffer = nullptr;
+    bool isMedia = false;
+    if (!isOutputBuffer &&
+        axion::graphics::MediaBufferConverter::isConversionEnabled()) {
+        AHardwareBuffer_Desc desc;
+        AHardwareBuffer_describe(bufferToUse, &desc);
+        ui::Dataspace dataspace = ui::Dataspace::UNKNOWN;
+        buffer->getDataspace(&dataspace);
+        if (axion::graphics::MediaBufferConverter::isMediaOrHdrBuffer(desc, static_cast<int32_t>(dataspace))) {
+            isMedia = true;
+            convertedBuffer = axion::graphics::MediaBufferConverter::convertToRgba8888(bufferToUse);
+            if (convertedBuffer) {
+                bufferToUse = convertedBuffer;
+            }
+        }
+    }
+
     // Do not lookup the buffer in the cache for protected contexts
-    if (!isProtected()) {
+    if (!isProtected() && !isMedia) {
         if (const auto& it = mTextureCache.find(buffer->getId()); it != mTextureCache.end()) {
             return it->second;
         }
+        if (auto texture = takeTransientBackendTexture(buffer, isOutputBuffer)) {
+            storeTransientBackendTexture(buffer, isOutputBuffer, texture);
+            return texture;
+        }
     }
     std::unique_ptr<SkiaBackendTexture> backendTexture =
-            getActiveContext()->makeBackendTexture(buffer->toAHardwareBuffer(), isOutputBuffer);
-    return std::make_shared<AutoBackendTexture::LocalRef>(std::move(backendTexture),
-                                                          mTextureCleanupMgr);
+            getActiveContext()->makeBackendTexture(bufferToUse, isOutputBuffer);
+    if (convertedBuffer) {
+        AHardwareBuffer_release(convertedBuffer);
+    }
+    auto texture = std::make_shared<AutoBackendTexture::LocalRef>(std::move(backendTexture),
+                                                                  mTextureCleanupMgr);
+    if (!isMedia) {
+        storeTransientBackendTexture(buffer, isOutputBuffer, texture);
+    }
+    return texture;
 }
 
 bool SkiaRenderEngine::canSkipPostRenderCleanup() const {
@@ -1046,30 +1144,31 @@ void SkiaRenderEngine::drawLayersInternal(
                 }
 
                 if (layer.backgroundBlurRadius > 0) {
+                    const uint32_t blurRadius =
+                            mBlurFilter->effectiveRadius(layer.backgroundBlurRadius);
                     SFTRACE_NAME("BackgroundBlur");
                     sk_sp<SkImage> blurredImage =
-                            mBlurFilter->generate(context, layer.backgroundBlurRadius,
-                                                  blurInput, blurRect);
-                    cachedBlurs[layer.backgroundBlurRadius] = blurredImage;
+                            mBlurFilter->generate(context, blurRadius, blurInput, blurRect);
+                    cachedBlurs[blurRadius] = blurredImage;
 
-                    mBlurFilter->drawBlurRegion(canvas, bounds, layer.backgroundBlurRadius,
-                                                layer.backgroundBlurScale, 1.0f,
-                                                blurRect, blurredImage, blurInput);
+                    mBlurFilter->drawBlurRegion(canvas, bounds, blurRadius,
+                                                layer.backgroundBlurScale, 1.0f, blurRect,
+                                                blurredImage, blurInput);
                 }
 
                 canvas->concat(getSkM44(layer.blurRegionTransform).asM33());
                 for (auto region : layer.blurRegions) {
-                    if (cachedBlurs[region.blurRadius] == nullptr) {
+                    const uint32_t blurRadius = mBlurFilter->effectiveRadius(region.blurRadius);
+                    if (cachedBlurs[blurRadius] == nullptr) {
                         SFTRACE_NAME("BlurRegion");
                         sk_sp<SkImage> blurredImage =
-                                mBlurFilter->generate(context, region.blurRadius,
-                                                      blurInput, blurRect);
-                        cachedBlurs[region.blurRadius] = blurredImage;
+                                mBlurFilter->generate(context, blurRadius, blurInput, blurRect);
+                        cachedBlurs[blurRadius] = blurredImage;
                     }
 
-                    mBlurFilter->drawBlurRegion(canvas, getBlurRRect(region), region.blurRadius,
-                                                1.0f, region.alpha, blurRect,
-                                                cachedBlurs[region.blurRadius], blurInput);
+                    mBlurFilter->drawBlurRegion(canvas, getBlurRRect(region), blurRadius, 1.0f,
+                                                region.alpha, blurRect, cachedBlurs[blurRadius],
+                                                blurInput);
                 }
             }
         }
@@ -1563,6 +1662,12 @@ void SkiaRenderEngine::drawShadow(SkCanvas* canvas,
 }
 
 void SkiaRenderEngine::onActiveDisplaySizeChanged(ui::Size size) {
+    {
+        std::lock_guard<std::mutex> lock(mRenderingMutex);
+        mBlurCache.clear();
+        mTransientTextureCache.clear();
+    }
+
     // This cache multiplier was selected based on review of cache sizes relative
     // to the screen resolution. Looking at the worst case memory needed by blur (~1.5x),
     // shadows (~1x), and general data structures (e.g. vertex buffers) we selected this as a

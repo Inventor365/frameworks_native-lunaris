@@ -17,9 +17,15 @@
 #pragma once
 
 #include <SkCanvas.h>
+#include <SkData.h>
 #include <SkImage.h>
 #include <SkRuntimeEffect.h>
 #include <SkSurface.h>
+
+#include <array>
+#include <cstddef>
+#include <cstdint>
+
 #include "BlurFilter.h"
 
 #include "RuntimeEffectManager.h"
@@ -35,22 +41,41 @@ public:
 
     sk_sp<SkImage> generate(SkiaGpuContext* context, const uint32_t radius,
                             const sk_sp<SkImage> blurInput, const SkRect& blurRect) const override;
+    uint32_t effectiveRadius(uint32_t radius) const override;
 
 private:
-    sk_sp<SkRuntimeEffect> mQuarterResDownSampleBlurEffect;
     sk_sp<SkRuntimeEffect> mHalfResDownSampleBlurEffect;
     sk_sp<SkRuntimeEffect> mUpSampleBlurEffect;
-    sk_sp<SkRuntimeEffect> mFinalUpSampleBlurEffect;
+    sk_sp<SkRuntimeEffect> mRotatedUpSampleBlurEffect;
 
-    static constexpr int kMaxCachedSurfaces = 3;
-    mutable sk_sp<SkSurface> mCachedSurfaces[kMaxCachedSurfaces];
-    mutable SkISize mCachedSurfaceSizes[kMaxCachedSurfaces] = {};
+    static constexpr float kRadiusToSigma = 0.577350269f;
+    float mInputScale = 0.1667f;
+    float mRadiusToScaledRadius = 0.09624f;
 
-    void blurInto(const sk_sp<SkSurface>& drawSurface, const sk_sp<SkImage>& readImage,
-                  const float radius, const float alpha, const sk_sp<SkRuntimeEffect>&) const;
+    static constexpr int kMaxSurfaces = 4;
+    static constexpr size_t kPoolCapacity = 3;
 
-    void blurInto(const sk_sp<SkSurface>& drawSurface, const sk_sp<SkShader> input,
-                  const float radius, const float alpha, const sk_sp<SkRuntimeEffect>&) const;
+    struct SurfaceSlot {
+        SkImageInfo info;
+        SkiaGpuContext* context = nullptr;
+        sk_sp<SkSurface> surface;
+        uint64_t lastUsedFrame = 0;
+    };
+
+    mutable std::array<std::array<SurfaceSlot, kPoolCapacity>, kMaxSurfaces> mPools;
+    mutable std::array<size_t, kMaxSurfaces> mCounts = {};
+    mutable uint64_t mFrameCounter = 0;
+
+    mutable float mLastStep = -1.0f;
+    mutable sk_sp<const SkData> mLastUniformsAxis;
+    mutable sk_sp<const SkData> mLastUniformsDiag;
+
+    sk_sp<SkSurface> obtainSurface(SkiaGpuContext* context, const SkImageInfo& info,
+                                   int index) const;
+
+    void blurInto(const sk_sp<SkSurface>& drawSurface, sk_sp<SkShader> input,
+                  const sk_sp<const SkData>& uniforms, const float alpha,
+                  const sk_sp<SkRuntimeEffect>& blurEffect) const;
 };
 
 } // namespace skia
